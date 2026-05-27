@@ -631,9 +631,13 @@ export async function buildDefinitionScanPreview({
 export async function runDefinitionSync({
   targetShop,
   admin,
+  selectedMetaobjectTypes,
+  selectedMetafieldKeys,
 }: {
   targetShop: string;
   admin: NonNullable<AdminGraphqlClient>;
+  selectedMetaobjectTypes?: string[];
+  selectedMetafieldKeys?: string[];
 }) {
   const credential = await prisma.sourceStoreCredential.findUnique({
     where: { targetShop },
@@ -650,6 +654,60 @@ export async function runDefinitionSync({
     admin,
   });
 
+  const selectedMetaobjectTypeSet = new Set(selectedMetaobjectTypes ?? []);
+  const selectedMetafieldKeySet = new Set(selectedMetafieldKeys ?? []);
+  const shouldFilterMetaobjects = selectedMetaobjectTypeSet.size > 0;
+  const shouldFilterMetafields = selectedMetafieldKeySet.size > 0;
+
+  const filteredPreview: DefinitionScanPreview = {
+    ...preview,
+    summary: {
+      ...preview.summary,
+      totalSourceMetafieldDefinitions: shouldFilterMetafields
+        ? preview.metafields.missing.filter((definition) =>
+            selectedMetafieldKeySet.has(
+              `${definition.ownerType}:${definition.namespace}:${definition.key}`,
+            ),
+          ).length
+        : preview.summary.totalSourceMetafieldDefinitions,
+      missingMetafieldDefinitions: shouldFilterMetafields
+        ? preview.metafields.missing.filter((definition) =>
+            selectedMetafieldKeySet.has(
+              `${definition.ownerType}:${definition.namespace}:${definition.key}`,
+            ),
+          ).length
+        : preview.summary.missingMetafieldDefinitions,
+      totalSourceMetaobjectDefinitions: shouldFilterMetaobjects
+        ? preview.metaobjects.missing.filter((definition) =>
+            selectedMetaobjectTypeSet.has(definition.type),
+          ).length
+        : preview.summary.totalSourceMetaobjectDefinitions,
+      missingMetaobjectDefinitions: shouldFilterMetaobjects
+        ? preview.metaobjects.missing.filter((definition) =>
+            selectedMetaobjectTypeSet.has(definition.type),
+          ).length
+        : preview.summary.missingMetaobjectDefinitions,
+    },
+    metafields: {
+      ...preview.metafields,
+      missing: shouldFilterMetafields
+        ? preview.metafields.missing.filter((definition) =>
+            selectedMetafieldKeySet.has(
+              `${definition.ownerType}:${definition.namespace}:${definition.key}`,
+            ),
+          )
+        : preview.metafields.missing,
+    },
+    metaobjects: {
+      ...preview.metaobjects,
+      missing: shouldFilterMetaobjects
+        ? preview.metaobjects.missing.filter((definition) =>
+            selectedMetaobjectTypeSet.has(definition.type),
+          )
+        : preview.metaobjects.missing,
+    },
+  };
+
   const job = await createSyncJob({
     sourceShop: credential.sourceShop,
     targetShop,
@@ -665,12 +723,12 @@ export async function runDefinitionSync({
   let failedCount = 0;
 
   await updateSyncJob(job.id, {
-    totalMetafieldDefinitions: preview.summary.totalSourceMetafieldDefinitions,
-    totalMetaobjectDefinitions: preview.summary.totalSourceMetaobjectDefinitions,
-    existingMetafieldDefinitions: preview.summary.existingMetafieldDefinitions,
-    existingMetaobjectDefinitions: preview.summary.existingMetaobjectDefinitions,
-    missingMetafieldDefinitions: preview.summary.missingMetafieldDefinitions,
-    missingMetaobjectDefinitions: preview.summary.missingMetaobjectDefinitions,
+    totalMetafieldDefinitions: filteredPreview.summary.totalSourceMetafieldDefinitions,
+    totalMetaobjectDefinitions: filteredPreview.summary.totalSourceMetaobjectDefinitions,
+    existingMetafieldDefinitions: filteredPreview.summary.existingMetafieldDefinitions,
+    existingMetaobjectDefinitions: filteredPreview.summary.existingMetaobjectDefinitions,
+    missingMetafieldDefinitions: filteredPreview.summary.missingMetafieldDefinitions,
+    missingMetaobjectDefinitions: filteredPreview.summary.missingMetaobjectDefinitions,
     conflictCount,
   });
 
@@ -693,7 +751,7 @@ export async function runDefinitionSync({
     } = await syncMetaobjectsWithDependencies({
       admin,
       jobId: job.id,
-      preview,
+      preview: filteredPreview,
     });
 
     createdMetaobjectDefinitions += createdMetaobjectCount;
@@ -706,7 +764,7 @@ export async function runDefinitionSync({
       syncedTargetMetaobjectIdByType,
     );
 
-    for (const definition of preview.metafields.existing) {
+    for (const definition of filteredPreview.metafields.existing) {
       await createSyncLog({
         jobId: job.id,
         itemType: "metafield_definition",
@@ -716,7 +774,7 @@ export async function runDefinitionSync({
       });
     }
 
-    for (const conflict of preview.metafields.conflicts) {
+    for (const conflict of filteredPreview.metafields.conflicts) {
       await createSyncLog({
         jobId: job.id,
         itemType: "metafield_definition",
@@ -726,10 +784,10 @@ export async function runDefinitionSync({
       });
     }
 
-    const sourceMetaobjectTypeById = buildSourceMetaobjectTypeById(preview);
-    const deferredMetafields: typeof preview.metafields.missing = [];
+    const sourceMetaobjectTypeById = buildSourceMetaobjectTypeById(filteredPreview);
+    const deferredMetafields: typeof filteredPreview.metafields.missing = [];
 
-    for (const definition of preview.metafields.missing) {
+    for (const definition of filteredPreview.metafields.missing) {
       const itemKey = `${definition.ownerType}:${definition.namespace}:${definition.key}`;
 
       try {
@@ -830,7 +888,7 @@ export async function runDefinitionSync({
       failedCount,
     });
 
-    return { jobId: job.id, preview };
+    return { jobId: job.id, preview: filteredPreview };
   } catch (error) {
     await updateSyncJob(job.id, {
       status: "failed",

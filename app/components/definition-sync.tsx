@@ -55,11 +55,66 @@ export function KeyValueTable({
   rows: ReactNode[][];
 }) {
   return (
-    <DataTable
-      columnContentTypes={new Array(headings.length).fill("text")}
-      headings={headings}
-      rows={rows}
-    />
+    <div
+      style={{
+        border: "1px solid var(--p-color-border-secondary)",
+        borderRadius: 12,
+        overflow: "hidden",
+      }}
+    >
+      <table
+        style={{
+          width: "100%",
+          borderCollapse: "collapse",
+          tableLayout: "fixed",
+        }}
+      >
+        <thead>
+          <tr style={{ background: "var(--p-color-bg-surface-secondary)" }}>
+            {headings.map((heading) => (
+              <th
+                key={heading}
+                style={{
+                  padding: "12px 16px",
+                  textAlign: "left",
+                  fontSize: 14,
+                  fontWeight: 600,
+                  borderBottom: "1px solid var(--p-color-border-secondary)",
+                  whiteSpace: "normal",
+                  wordBreak: "break-word",
+                }}
+              >
+                {heading}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, rowIndex) => (
+            <tr key={`row-${rowIndex}`}>
+              {row.map((cell, cellIndex) => (
+                <td
+                  key={`cell-${rowIndex}-${cellIndex}`}
+                  style={{
+                    padding: "12px 16px",
+                    verticalAlign: "top",
+                    borderBottom:
+                      rowIndex === rows.length - 1
+                        ? "none"
+                        : "1px solid var(--p-color-border-secondary)",
+                    whiteSpace: "normal",
+                    wordBreak: "break-word",
+                    overflowWrap: "anywhere",
+                  }}
+                >
+                  {cell}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
