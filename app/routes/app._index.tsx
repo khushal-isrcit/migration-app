@@ -4,6 +4,7 @@ import {
   Button,
   Card,
   Checkbox,
+  Divider,
   FormLayout,
   InlineStack,
   Layout,
@@ -334,14 +335,11 @@ export default function DefinitionSyncSinglePage() {
   }>;
   const missingMetaobjects = preview?.metaobjects.missing ?? [];
   const missingMetafields = preview?.metafields.missing ?? [];
-  const metaobjectAllSelected =
-    missingMetaobjects.length > 0 &&
-    selectedMetaobjectTypes.length === missingMetaobjects.length;
-  const metafieldAllSelected =
-    missingMetafields.length > 0 &&
-    selectedMetafieldKeys.length === missingMetafields.length;
   const totalSelectedCount =
     selectedMetaobjectTypes.length + selectedMetafieldKeys.length;
+  const allSelectableCount = missingMetaobjects.length + missingMetafields.length;
+  const allSelected =
+    allSelectableCount > 0 && totalSelectedCount === allSelectableCount;
   const metafieldNameByIdentifier = new Map<string, string>();
   const metaobjectNameByType = new Map<string, string>();
   const metaobjectFieldNameByIdentifier = new Map<string, string>();
@@ -505,10 +503,8 @@ export default function DefinitionSyncSinglePage() {
                       <SummaryTable
                         rows={[
                           ["Missing metafield definitions", preview.summary.missingMetafieldDefinitions],
-                          ["Existing metafield definitions", preview.summary.existingMetafieldDefinitions],
                           ["Conflicting metafield definitions", preview.summary.conflictingMetafieldDefinitions],
                           ["Missing metaobject definitions", preview.summary.missingMetaobjectDefinitions],
-                          ["Existing metaobject definitions", preview.summary.existingMetaobjectDefinitions],
                           ["Missing metaobject fields", preview.summary.missingMetaobjectFields],
                           ["Conflicting metaobject fields", preview.summary.conflictingMetaobjectFields],
                         ]}
@@ -519,20 +515,30 @@ export default function DefinitionSyncSinglePage() {
                       <BlockStack gap="300">
                         <InlineStack align="space-between" blockAlign="center">
                           <Text as="h2" variant="headingMd">
-                            Missing Metaobjects
+                            Missing Definitions
                           </Text>
                           <InlineStack gap="200">
                             <Button
-                              onClick={() =>
+                              onClick={() => {
+                                if (allSelected) {
+                                  setSelectedMetaobjectTypes([]);
+                                  setSelectedMetafieldKeys([]);
+                                  return;
+                                }
+
                                 setSelectedMetaobjectTypes(
-                                  metaobjectAllSelected
-                                    ? []
-                                    : missingMetaobjects.map((item) => item.type),
-                                )
-                              }
-                              disabled={!missingMetaobjects.length || isSyncing}
+                                  missingMetaobjects.map((item) => item.type),
+                                );
+                                setSelectedMetafieldKeys(
+                                  missingMetafields.map(
+                                    (item) =>
+                                      `${item.ownerType}:${item.namespace}:${item.key}`,
+                                  ),
+                                );
+                              }}
+                              disabled={!allSelectableCount || isSyncing}
                             >
-                              {metaobjectAllSelected ? "Clear all" : "Select all"}
+                              {allSelected ? "Clear all" : "Select all"}
                             </Button>
                             <Button
                               variant="primary"
@@ -553,6 +559,12 @@ export default function DefinitionSyncSinglePage() {
                             </Text>
                           </InlineStack>
                         ) : null}
+
+                        <InlineStack align="space-between" blockAlign="center">
+                          <Text as="h3" variant="headingMd">
+                            Missing Metaobjects
+                          </Text>
+                        </InlineStack>
 
                         {preview.metaobjects.missing.length ? (
                           <BlockStack gap="200">
@@ -583,30 +595,13 @@ export default function DefinitionSyncSinglePage() {
                             No missing metaobject definitions were found.
                           </Text>
                         )}
-                      </BlockStack>
-                    </Card>
 
-                    <Card>
-                      <BlockStack gap="300">
+                        <Divider />
+
                         <InlineStack align="space-between" blockAlign="center">
-                          <Text as="h2" variant="headingMd">
+                          <Text as="h3" variant="headingMd">
                             Missing Metafields
                           </Text>
-                          <Button
-                            onClick={() =>
-                              setSelectedMetafieldKeys(
-                                metafieldAllSelected
-                                  ? []
-                                  : missingMetafields.map(
-                                      (item) =>
-                                        `${item.ownerType}:${item.namespace}:${item.key}`,
-                                    ),
-                              )
-                            }
-                            disabled={!missingMetafields.length || isSyncing}
-                          >
-                            {metafieldAllSelected ? "Clear all" : "Select all"}
-                          </Button>
                         </InlineStack>
                         {preview.metafields.missing.length ? (
                           <BlockStack gap="200">
