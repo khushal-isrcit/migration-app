@@ -78,7 +78,7 @@ export default function DefinitionSyncDashboard() {
                   <Text as="h2" variant="headingMd">
                     Store connections
                   </Text>
-                  <Button onClick={() => navigate("/app/definition-sync/source")}>
+                  <Button onClick={() => navigate("/app/source")}>
                     {credential ? "Update source token" : "Add source token"}
                   </Button>
                 </InlineStack>
@@ -124,12 +124,12 @@ export default function DefinitionSyncDashboard() {
                   <InlineStack gap="200">
                     <Button
                       variant="primary"
-                      onClick={() => navigate("/app/definition-sync/scan")}
+                      onClick={() => navigate("/app/scan")}
                       disabled={!credential}
                     >
                       Scan definitions
                     </Button>
-                    <Button onClick={() => navigate("/app/definition-sync/logs")}>
+                    <Button onClick={() => navigate("/app/logs")}>
                       View logs
                     </Button>
                   </InlineStack>
@@ -147,7 +147,7 @@ export default function DefinitionSyncDashboard() {
                 {latestJob ? (
                   <Text as="p">
                     Latest sync job:{" "}
-                    <Link to={`/app/definition-sync/logs?jobId=${latestJob.id}`}>
+                    <Link to={`/app/logs?jobId=${latestJob.id}`}>
                       {latestJob.id}
                     </Link>{" "}
                     with status <StatusBadge status={latestJob.status} />.

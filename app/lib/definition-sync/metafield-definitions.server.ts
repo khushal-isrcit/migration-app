@@ -188,7 +188,10 @@ export async function createMetafieldDefinition(
         ownerType: definition.ownerType,
         type: definition.type,
         description: definition.description,
-        validations: definition.validations,
+        validations: definition.validations.map((validation) => ({
+          name: validation.name,
+          value: validation.value,
+        })),
       },
     },
   );

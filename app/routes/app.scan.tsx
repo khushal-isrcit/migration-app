@@ -33,7 +33,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
   });
 
   if (!credential) {
-    return redirect("/app/definition-sync/source");
+    return redirect("/app/source");
   }
 
   try {
@@ -254,7 +254,7 @@ export default function ScanDefinitionsPage() {
                       </Text>
                       <Form
                         method="post"
-                        action="/app/definition-sync/sync"
+                        action="/app/sync"
                         onSubmit={(event) => {
                           event.preventDefault();
                           submit(event.currentTarget, { method: "post" });

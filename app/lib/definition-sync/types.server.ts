@@ -25,20 +25,30 @@ export type LogStatus = (typeof LOG_STATUSES)[number];
 export type SyncItemType = (typeof ITEM_TYPES)[number];
 
 export const SUPPORTED_METAFIELD_OWNER_TYPES = [
+  "API_PERMISSION",
   "ARTICLE",
   "BLOG",
+  "CARTTRANSFORM",
   "COLLECTION",
   "COMPANY",
   "COMPANY_LOCATION",
   "CUSTOMER",
+  "DELIVERY_CUSTOMIZATION",
+  "DISCOUNT",
   "DRAFTORDER",
+  "FULFILLMENT_CONSTRAINT_RULE",
+  "GIFT_CARD_TRANSACTION",
   "LOCATION",
   "MARKET",
   "ORDER",
+  "ORDER_ROUTING_LOCATION_RULE",
   "PAGE",
+  "PAYMENT_CUSTOMIZATION",
   "PRODUCT",
   "PRODUCTVARIANT",
+  "SELLING_PLAN",
   "SHOP",
+  "VALIDATION",
 ] as const;
 
 export interface GraphqlUserError {

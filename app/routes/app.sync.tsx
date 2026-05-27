@@ -8,7 +8,7 @@ import { authenticate } from "../shopify.server";
 
 export async function loader({ request }: LoaderFunctionArgs) {
   const { redirect } = await authenticate.admin(request);
-  return redirect("/app/definition-sync");
+  return redirect("/app");
 }
 
 export async function action({ request }: ActionFunctionArgs) {
@@ -18,7 +18,7 @@ export async function action({ request }: ActionFunctionArgs) {
     admin,
   });
 
-  return redirect(`/app/definition-sync/logs?jobId=${result.jobId}`);
+  return redirect(`/app/logs?jobId=${result.jobId}`);
 }
 
 export default function SyncDefinitionsPage() {

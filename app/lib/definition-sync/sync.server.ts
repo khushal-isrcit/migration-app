@@ -18,9 +18,513 @@ import {
   createMetaobjectDefinition,
   fetchMetaobjectDefinitions,
 } from "./metaobject-definitions.server";
-import type { DefinitionScanPreview } from "./types.server";
+import type {
+  DefinitionScanPreview,
+  MetaobjectDefinitionRecord,
+  MetaobjectFieldDefinitionRecord,
+  ValidationRule,
+} from "./types.server";
 
 type AdminGraphqlClient = Parameters<typeof fetchMetafieldDefinitions>[0]["admin"];
+
+const METAOBJECT_REFERENCE_VALIDATION_NAMES = new Set([
+  "metaobject_definition_id",
+  "metaobject_definition_ids",
+]);
+
+function parseMetaobjectDefinitionValidationValue(validation: ValidationRule) {
+  if (!validation.value) {
+    return [];
+  }
+
+  if (validation.name === "metaobject_definition_id") {
+    return [validation.value];
+  }
+
+  if (validation.name === "metaobject_definition_ids") {
+    try {
+      const parsed = JSON.parse(validation.value);
+      return Array.isArray(parsed)
+        ? parsed.filter((value): value is string => typeof value === "string")
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  return [];
+}
+
+function getReferencedMetaobjectTypes(
+  validations: ValidationRule[],
+  sourceMetaobjectTypeById: Map<string, string>,
+) {
+  const referencedTypes = new Set<string>();
+
+  for (const validation of validations) {
+    if (!METAOBJECT_REFERENCE_VALIDATION_NAMES.has(validation.name)) {
+      continue;
+    }
+
+    for (const definitionId of parseMetaobjectDefinitionValidationValue(validation)) {
+      const type = sourceMetaobjectTypeById.get(definitionId);
+      if (type) {
+        referencedTypes.add(type);
+      }
+    }
+  }
+
+  return [...referencedTypes];
+}
+
+function hasMetaobjectReferenceValidation(validations: ValidationRule[]) {
+  return validations.some((validation) =>
+    METAOBJECT_REFERENCE_VALIDATION_NAMES.has(validation.name),
+  );
+}
+
+function buildSourceMetaobjectTypeById(preview: DefinitionScanPreview) {
+  const sourceMetaobjectTypeById = new Map<string, string>();
+
+  for (const definition of [
+    ...preview.metaobjects.missing,
+    ...preview.metaobjects.existing.map((item) => item.source),
+  ]) {
+    if (definition.id) {
+      sourceMetaobjectTypeById.set(definition.id, definition.type);
+    }
+  }
+
+  return sourceMetaobjectTypeById;
+}
+
+function buildTargetMetaobjectIdByType(
+  definitions: MetaobjectDefinitionRecord[],
+  existingTypes?: Map<string, string>,
+) {
+  const targetMetaobjectIdByType = new Map(existingTypes ?? []);
+
+  for (const definition of definitions) {
+    if (definition.id) {
+      targetMetaobjectIdByType.set(definition.type, definition.id);
+    }
+  }
+
+  return targetMetaobjectIdByType;
+}
+
+function remapMetaobjectReferenceValidations(
+  validations: ValidationRule[],
+  sourceMetaobjectTypeById: Map<string, string>,
+  targetMetaobjectIdByType: Map<string, string>,
+) {
+  return validations.map((validation) => {
+    if (!METAOBJECT_REFERENCE_VALIDATION_NAMES.has(validation.name)) {
+      return validation;
+    }
+
+    const targetIds = parseMetaobjectDefinitionValidationValue(validation).map(
+      (definitionId) => {
+        const type = sourceMetaobjectTypeById.get(definitionId);
+
+        if (!type) {
+          throw new Error(
+            `Couldn't match source metaobject definition ${definitionId} to a metaobject type.`,
+          );
+        }
+
+        const targetId = targetMetaobjectIdByType.get(type);
+
+        if (!targetId) {
+          throw new Error(
+            `Target metaobject definition for type ${type} is not available yet.`,
+          );
+        }
+
+        return targetId;
+      },
+    );
+
+    return {
+      ...validation,
+      value:
+        validation.name === "metaobject_definition_id"
+          ? targetIds[0] ?? null
+          : JSON.stringify(targetIds),
+    };
+  });
+}
+
+function prepareMetaobjectField(
+  field: MetaobjectFieldDefinitionRecord,
+  sourceMetaobjectTypeById: Map<string, string>,
+  targetMetaobjectIdByType: Map<string, string>,
+): MetaobjectFieldDefinitionRecord {
+  return {
+    ...field,
+    validations: remapMetaobjectReferenceValidations(
+      field.validations,
+      sourceMetaobjectTypeById,
+      targetMetaobjectIdByType,
+    ),
+  };
+}
+
+function prepareMetaobjectDefinition(
+  definition: MetaobjectDefinitionRecord,
+  fields: MetaobjectFieldDefinitionRecord[],
+  sourceMetaobjectTypeById: Map<string, string>,
+  targetMetaobjectIdByType: Map<string, string>,
+): MetaobjectDefinitionRecord {
+  const includedFieldKeys = new Set(fields.map((field) => field.key));
+
+  return {
+    ...definition,
+    displayNameKey:
+      definition.displayNameKey && includedFieldKeys.has(definition.displayNameKey)
+        ? definition.displayNameKey
+        : null,
+    fieldDefinitions: fields.map((field) =>
+      prepareMetaobjectField(
+        field,
+        sourceMetaobjectTypeById,
+        targetMetaobjectIdByType,
+      ),
+    ),
+  };
+}
+
+function partitionFieldsByResolvedDependencies(
+  fields: MetaobjectFieldDefinitionRecord[],
+  sourceMetaobjectTypeById: Map<string, string>,
+  targetMetaobjectIdByType: Map<string, string>,
+) {
+  const ready: MetaobjectFieldDefinitionRecord[] = [];
+  const blocked: Array<{
+    field: MetaobjectFieldDefinitionRecord;
+    missingTypes: string[];
+  }> = [];
+
+  for (const field of fields) {
+    const missingTypes = getReferencedMetaobjectTypes(
+      field.validations,
+      sourceMetaobjectTypeById,
+    ).filter((type) => !targetMetaobjectIdByType.has(type));
+
+    if (missingTypes.length) {
+      blocked.push({ field, missingTypes });
+      continue;
+    }
+
+    ready.push(field);
+  }
+
+  return { ready, blocked };
+}
+
+async function syncMetaobjectsWithDependencies({
+  admin,
+  jobId,
+  preview,
+}: {
+  admin: NonNullable<AdminGraphqlClient>;
+  jobId: string;
+  preview: DefinitionScanPreview;
+}) {
+  let createdMetaobjectDefinitions = 0;
+  let addedMetaobjectFields = 0;
+  let failedCount = 0;
+
+  const sourceMetaobjectDefinitions = [
+    ...preview.metaobjects.missing,
+    ...preview.metaobjects.existing.map((item) => item.source),
+  ];
+  const sourceMetaobjectTypeById = new Map<string, string>();
+  for (const definition of sourceMetaobjectDefinitions) {
+    if (definition.id) {
+      sourceMetaobjectTypeById.set(definition.id, definition.type);
+    }
+  }
+
+  const targetMetaobjectIdByType = new Map<string, string>();
+  for (const item of preview.metaobjects.existing) {
+    if (item.target?.id) {
+      targetMetaobjectIdByType.set(item.type, item.target.id);
+    }
+  }
+
+  const pendingFieldAdds = new Map<
+    string,
+    {
+      definitionId: string;
+      fields: MetaobjectFieldDefinitionRecord[];
+      displayNameKey?: string | null;
+    }
+  >();
+
+  for (const item of preview.metaobjects.existing) {
+    await createSyncLog({
+      jobId,
+      itemType: "metaobject_definition",
+      itemKey: item.type,
+      status: "exists",
+      message: "Metaobject definition already exists.",
+    });
+
+    for (const fieldConflict of item.fieldConflicts) {
+      await createSyncLog({
+        jobId,
+        itemType: "metaobject_field",
+        itemKey: fieldConflict.key,
+        status: "conflict",
+        message: fieldConflict.message,
+      });
+    }
+
+    if (item.missingFields.length && item.target?.id) {
+      pendingFieldAdds.set(item.type, {
+        definitionId: item.target.id,
+        fields: [...item.missingFields],
+        displayNameKey: item.source.displayNameKey,
+      });
+    }
+  }
+
+  const pendingDefinitions = new Map(
+    preview.metaobjects.missing.map((definition) => [definition.type, definition]),
+  );
+
+  while (pendingDefinitions.size > 0) {
+    let madeProgress = false;
+
+    for (const [type, definition] of [...pendingDefinitions.entries()]) {
+      const { ready, blocked } = partitionFieldsByResolvedDependencies(
+        definition.fieldDefinitions,
+        sourceMetaobjectTypeById,
+        targetMetaobjectIdByType,
+      );
+
+      if (!ready.length && blocked.length) {
+        continue;
+      }
+
+      try {
+        const createdDefinition = await createMetaobjectDefinition(
+          admin,
+          prepareMetaobjectDefinition(
+            definition,
+            ready,
+            sourceMetaobjectTypeById,
+            targetMetaobjectIdByType,
+          ),
+        );
+
+        createdMetaobjectDefinitions += 1;
+        targetMetaobjectIdByType.set(type, createdDefinition.id);
+        pendingDefinitions.delete(type);
+        madeProgress = true;
+
+        await createSyncLog({
+          jobId,
+          itemType: "metaobject_definition",
+          itemKey: definition.type,
+          status: "created",
+          message:
+            ready.length === definition.fieldDefinitions.length
+              ? "Created missing metaobject definition."
+              : "Created missing metaobject definition and deferred dependent reference fields.",
+        });
+
+        if (blocked.length) {
+          pendingFieldAdds.set(type, {
+            definitionId: createdDefinition.id,
+            fields: blocked.map((item) => item.field),
+            displayNameKey: definition.displayNameKey,
+          });
+        }
+      } catch (error) {
+        failedCount += 1;
+        pendingDefinitions.delete(type);
+
+        await createSyncLog({
+          jobId,
+          itemType: "metaobject_definition",
+          itemKey: definition.type,
+          status: "failed",
+          message: error instanceof Error ? error.message : "Creation failed.",
+        });
+      }
+    }
+
+    if (madeProgress) {
+      continue;
+    }
+
+    for (const [type, definition] of [...pendingDefinitions.entries()]) {
+      try {
+        const createdDefinition = await createMetaobjectDefinition(
+          admin,
+          {
+            ...definition,
+            displayNameKey: null,
+            fieldDefinitions: [],
+          },
+        );
+
+        createdMetaobjectDefinitions += 1;
+        targetMetaobjectIdByType.set(type, createdDefinition.id);
+        pendingDefinitions.delete(type);
+        madeProgress = true;
+
+        await createSyncLog({
+          jobId,
+          itemType: "metaobject_definition",
+          itemKey: definition.type,
+          status: "created",
+          message:
+            "Created missing metaobject definition shell so dependent reference fields can be added later.",
+        });
+
+        pendingFieldAdds.set(type, {
+          definitionId: createdDefinition.id,
+          fields: [...definition.fieldDefinitions],
+          displayNameKey: definition.displayNameKey,
+        });
+      } catch (error) {
+        failedCount += 1;
+        pendingDefinitions.delete(type);
+
+        await createSyncLog({
+          jobId,
+          itemType: "metaobject_definition",
+          itemKey: definition.type,
+          status: "failed",
+          message: error instanceof Error ? error.message : "Creation failed.",
+        });
+      }
+    }
+
+    if (!madeProgress) {
+      break;
+    }
+  }
+
+  while (pendingFieldAdds.size > 0) {
+    let madeProgress = false;
+
+    for (const [type, pending] of [...pendingFieldAdds.entries()]) {
+      const { ready, blocked } = partitionFieldsByResolvedDependencies(
+        pending.fields,
+        sourceMetaobjectTypeById,
+        targetMetaobjectIdByType,
+      );
+
+      if (!ready.length) {
+        continue;
+      }
+
+      try {
+        const displayNameKey =
+          pending.displayNameKey &&
+          ready.some((field) => field.key === pending.displayNameKey)
+            ? pending.displayNameKey
+            : null;
+
+        await addMissingMetaobjectFields(
+          admin,
+          pending.definitionId,
+          ready.map((field) =>
+            prepareMetaobjectField(
+              field,
+              sourceMetaobjectTypeById,
+              targetMetaobjectIdByType,
+            ),
+          ),
+          displayNameKey,
+        );
+
+        addedMetaobjectFields += ready.length;
+        madeProgress = true;
+
+        for (const field of ready) {
+          await createSyncLog({
+            jobId,
+            itemType: "metaobject_field",
+            itemKey: `${type}.${field.key}`,
+            status: "created",
+            message: "Added missing metaobject field.",
+          });
+        }
+
+        if (blocked.length) {
+          pendingFieldAdds.set(type, {
+            ...pending,
+            fields: blocked.map((item) => item.field),
+            displayNameKey:
+              displayNameKey && pending.displayNameKey === displayNameKey
+                ? null
+                : pending.displayNameKey,
+          });
+        } else {
+          pendingFieldAdds.delete(type);
+        }
+      } catch (error) {
+        failedCount += ready.length;
+        pendingFieldAdds.delete(type);
+
+        for (const field of ready) {
+          await createSyncLog({
+            jobId,
+            itemType: "metaobject_field",
+            itemKey: `${type}.${field.key}`,
+            status: "failed",
+            message:
+              error instanceof Error ? error.message : "Failed to add field.",
+          });
+        }
+      }
+    }
+
+    if (madeProgress) {
+      continue;
+    }
+
+    for (const [type, pending] of pendingFieldAdds.entries()) {
+      const unresolvedTypes = new Set(
+        pending.fields.flatMap((field) =>
+          getReferencedMetaobjectTypes(field.validations, sourceMetaobjectTypeById).filter(
+            (referencedType) => !targetMetaobjectIdByType.has(referencedType),
+          ),
+        ),
+      );
+
+      failedCount += pending.fields.length;
+
+      for (const field of pending.fields) {
+        await createSyncLog({
+          jobId,
+          itemType: "metaobject_field",
+          itemKey: `${type}.${field.key}`,
+          status: "failed",
+          message: unresolvedTypes.size
+            ? `Referenced metaobject definitions are still missing in target: ${[
+                ...unresolvedTypes,
+              ].join(", ")}.`
+            : "Failed to add field.",
+        });
+      }
+    }
+
+    pendingFieldAdds.clear();
+  }
+
+  return {
+    createdMetaobjectDefinitions,
+    addedMetaobjectFields,
+    failedCount,
+    targetMetaobjectIdByType,
+  };
+}
 
 export async function buildDefinitionScanPreview({
   sourceShop,
@@ -87,6 +591,15 @@ export async function buildDefinitionScanPreview({
       ),
   ];
 
+  if (
+    sourceMetafields.definitions.length > 0 ||
+    targetMetafields.definitions.length > 0
+  ) {
+    ownerTypeWarnings.push(
+      "Shopify won't expose app-owned metafield definitions that belong to a different app, even if they are visible in the Shopify admin.",
+    );
+  }
+
   return {
     sourceShop,
     targetShop,
@@ -146,7 +659,7 @@ export async function runDefinitionSync({
   let createdMetafieldDefinitions = 0;
   let createdMetaobjectDefinitions = 0;
   let addedMetaobjectFields = 0;
-  let conflictCount =
+  const conflictCount =
     preview.summary.conflictingMetafieldDefinitions +
     preview.summary.conflictingMetaobjectFields;
   let failedCount = 0;
@@ -172,6 +685,27 @@ export async function runDefinitionSync({
       });
     }
 
+    const {
+      createdMetaobjectDefinitions: createdMetaobjectCount,
+      addedMetaobjectFields: addedMetaobjectFieldCount,
+      failedCount: metaobjectFailedCount,
+      targetMetaobjectIdByType: syncedTargetMetaobjectIdByType,
+    } = await syncMetaobjectsWithDependencies({
+      admin,
+      jobId: job.id,
+      preview,
+    });
+
+    createdMetaobjectDefinitions += createdMetaobjectCount;
+    addedMetaobjectFields += addedMetaobjectFieldCount;
+    failedCount += metaobjectFailedCount;
+
+    const refreshedTargetMetaobjects = await fetchMetaobjectDefinitions({ admin });
+    let targetMetaobjectIdByType = buildTargetMetaobjectIdByType(
+      refreshedTargetMetaobjects.definitions,
+      syncedTargetMetaobjectIdByType,
+    );
+
     for (const definition of preview.metafields.existing) {
       await createSyncLog({
         jobId: job.id,
@@ -192,11 +726,23 @@ export async function runDefinitionSync({
       });
     }
 
+    const sourceMetaobjectTypeById = buildSourceMetaobjectTypeById(preview);
+    const deferredMetafields: typeof preview.metafields.missing = [];
+
     for (const definition of preview.metafields.missing) {
       const itemKey = `${definition.ownerType}:${definition.namespace}:${definition.key}`;
 
       try {
-        await createMetafieldDefinition(admin, definition);
+        const preparedDefinition = {
+          ...definition,
+          validations: remapMetaobjectReferenceValidations(
+            definition.validations,
+            sourceMetaobjectTypeById,
+            targetMetaobjectIdByType,
+          ),
+        };
+
+        await createMetafieldDefinition(admin, preparedDefinition);
         createdMetafieldDefinitions += 1;
         await createSyncLog({
           jobId: job.id,
@@ -206,87 +752,70 @@ export async function runDefinitionSync({
           message: "Created missing metafield definition.",
         });
       } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "Creation failed.";
+
+        if (hasMetaobjectReferenceValidation(definition.validations)) {
+          deferredMetafields.push(definition);
+          await createSyncLog({
+            jobId: job.id,
+            itemType: "metafield_definition",
+            itemKey,
+            status: "skipped",
+            message: `Deferred metafield definition for one retry after metaobject sync settles. Original error: ${message}`,
+          });
+          continue;
+        }
+
         failedCount += 1;
         await createSyncLog({
           jobId: job.id,
           itemType: "metafield_definition",
           itemKey,
           status: "failed",
-          message: error instanceof Error ? error.message : "Creation failed.",
+          message,
         });
       }
     }
 
-    for (const definition of preview.metaobjects.missing) {
-      try {
-        await createMetaobjectDefinition(admin, definition);
-        createdMetaobjectDefinitions += 1;
-        await createSyncLog({
-          jobId: job.id,
-          itemType: "metaobject_definition",
-          itemKey: definition.type,
-          status: "created",
-          message: "Created missing metaobject definition.",
-        });
-      } catch (error) {
-        failedCount += 1;
-        await createSyncLog({
-          jobId: job.id,
-          itemType: "metaobject_definition",
-          itemKey: definition.type,
-          status: "failed",
-          message: error instanceof Error ? error.message : "Creation failed.",
-        });
-      }
-    }
+    if (deferredMetafields.length) {
+      const retryTargetMetaobjects = await fetchMetaobjectDefinitions({ admin });
+      targetMetaobjectIdByType = buildTargetMetaobjectIdByType(
+        retryTargetMetaobjects.definitions,
+        targetMetaobjectIdByType,
+      );
 
-    for (const item of preview.metaobjects.existing) {
-      await createSyncLog({
-        jobId: job.id,
-        itemType: "metaobject_definition",
-        itemKey: item.type,
-        status: "exists",
-        message: "Metaobject definition already exists.",
-      });
+      for (const definition of deferredMetafields) {
+        const itemKey = `${definition.ownerType}:${definition.namespace}:${definition.key}`;
 
-      for (const fieldConflict of item.fieldConflicts) {
-        await createSyncLog({
-          jobId: job.id,
-          itemType: "metaobject_field",
-          itemKey: fieldConflict.key,
-          status: "conflict",
-          message: fieldConflict.message,
-        });
-      }
+        try {
+          const preparedDefinition = {
+            ...definition,
+            validations: remapMetaobjectReferenceValidations(
+              definition.validations,
+              sourceMetaobjectTypeById,
+              targetMetaobjectIdByType,
+            ),
+          };
 
-      if (!item.missingFields.length || !item.target?.id) {
-        continue;
-      }
-
-      try {
-        await addMissingMetaobjectFields(admin, item.target.id, item.missingFields);
-        addedMetaobjectFields += item.missingFields.length;
-
-        for (const field of item.missingFields) {
+          await createMetafieldDefinition(admin, preparedDefinition);
+          createdMetafieldDefinitions += 1;
           await createSyncLog({
             jobId: job.id,
-            itemType: "metaobject_field",
-            itemKey: `${item.type}.${field.key}`,
+            itemType: "metafield_definition",
+            itemKey,
             status: "created",
-            message: "Added missing metaobject field.",
+            message: "Created missing metafield definition after retry.",
           });
-        }
-      } catch (error) {
-        failedCount += item.missingFields.length;
-
-        for (const field of item.missingFields) {
+        } catch (error) {
+          failedCount += 1;
           await createSyncLog({
             jobId: job.id,
-            itemType: "metaobject_field",
-            itemKey: `${item.type}.${field.key}`,
+            itemType: "metafield_definition",
+            itemKey,
             status: "failed",
             message:
-              error instanceof Error ? error.message : "Failed to add field.",
+              error instanceof Error ? error.message : "Creation failed.",
           });
         }
       }

@@ -20,9 +20,7 @@ import {
 import prisma from "../db.server";
 import { StatusBadge } from "../components/definition-sync";
 import { encryptToken } from "../lib/definition-sync/encryption.server";
-import {
-  validateSourceToken,
-} from "../lib/definition-sync/source-admin.server";
+import { validateSourceToken } from "../lib/definition-sync/source-admin.server";
 import {
   normalizeShopDomain,
   validateShopDomain,

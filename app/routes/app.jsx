@@ -1,7 +1,12 @@
-import { Outlet, useLoaderData, useRouteError } from "react-router";
+import { NavLink, Outlet, useLoaderData, useLocation, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { AppProvider as EmbeddedAppProvider } from "@shopify/shopify-app-react-router/react";
-import { AppProvider as PolarisAppProvider } from "@shopify/polaris";
+import { NavMenu } from "@shopify/app-bridge-react";
+import {
+  AppProvider as PolarisAppProvider,
+  Card,
+  InlineStack,
+} from "@shopify/polaris";
 import enTranslations from "@shopify/polaris/locales/en.json";
 import { authenticate } from "../shopify.server";
 
@@ -14,16 +19,25 @@ export const loader = async ({ request }) => {
 
 export default function App() {
   const { apiKey } = useLoaderData();
+  const location = useLocation();
+  const navItems = [
+    { to: "/app", label: "Home" },
+    { to: "/app/source", label: "Source" },
+    { to: "/app/scan", label: "Scan" },
+    { to: "/app/logs", label: "Logs" },
+  ];
 
   return (
     <EmbeddedAppProvider embedded apiKey={apiKey}>
       <PolarisAppProvider i18n={enTranslations}>
-        <s-app-nav>
-          <s-link href="/app/definition-sync">Definition Sync</s-link>
-          <s-link href="/app/definition-sync/source">Source Credentials</s-link>
-          <s-link href="/app/definition-sync/scan">Scan Preview</s-link>
-          <s-link href="/app/definition-sync/logs">Logs</s-link>
-        </s-app-nav>
+        <NavMenu key={location.pathname}>
+          <a href="/app" rel="home">
+            Home
+          </a>
+          <a href="/app/source">Source</a>
+          <a href="/app/scan">Scan</a>
+          <a href="/app/logs">Logs</a>
+        </NavMenu>
         <Outlet />
       </PolarisAppProvider>
     </EmbeddedAppProvider>

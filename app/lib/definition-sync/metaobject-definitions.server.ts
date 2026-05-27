@@ -202,6 +202,7 @@ export async function addMissingMetaobjectFields(
   admin: AdminGraphqlClient,
   metaobjectDefinitionId: string,
   fields: MetaobjectFieldDefinitionRecord[],
+  displayNameKey?: string | null,
 ) {
   const data = await targetAdminGraphql<
     {
@@ -230,6 +231,7 @@ export async function addMissingMetaobjectFields(
     {
       id: metaobjectDefinitionId,
       definition: {
+        displayNameKey: displayNameKey ?? undefined,
         fieldDefinitions: fields.map((field) => ({
           create: {
             key: field.key,

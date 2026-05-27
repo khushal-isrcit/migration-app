@@ -86,7 +86,7 @@ export function WarningsBanner({ warnings }: { warnings: string[] }) {
   }
 
   return (
-    <Banner tone="warning" title="Some owner types could not be scanned">
+    <Banner tone="warning" title="Scan warnings and limits">
       <ul style={{ margin: 0, paddingLeft: 18 }}>
         {warnings.map((warning) => (
           <li key={warning}>{warning}</li>
