@@ -5,6 +5,10 @@ import type {
   MetaobjectComparisonItem,
   MetaobjectDefinitionRecord,
 } from "./types.server";
+import {
+  getMetaobjectTypeLogicalKey,
+  isAppReservedMetaobjectType,
+} from "./metaobject-type.server";
 
 function metafieldIdentifier(definition: MetafieldDefinitionRecord) {
   return `${definition.ownerType}:${definition.namespace}:${definition.key}`;
@@ -60,7 +64,9 @@ export function compareMetaobjectDefinitions(
   targetDefinitions: MetaobjectDefinitionRecord[],
 ) {
   const targetByType = new Map(
-    targetDefinitions.map((definition) => [definition.type, definition]),
+    targetDefinitions
+      .filter((definition) => isAppReservedMetaobjectType(definition.type))
+      .map((definition) => [getMetaobjectTypeLogicalKey(definition.type), definition]),
   );
 
   const missing: MetaobjectDefinitionRecord[] = [];
@@ -68,7 +74,9 @@ export function compareMetaobjectDefinitions(
   const conflicts: MetaobjectComparisonItem[] = [];
 
   for (const sourceDefinition of sourceDefinitions) {
-    const targetDefinition = targetByType.get(sourceDefinition.type);
+    const targetDefinition = targetByType.get(
+      getMetaobjectTypeLogicalKey(sourceDefinition.type),
+    );
 
     if (!targetDefinition) {
       missing.push(sourceDefinition);

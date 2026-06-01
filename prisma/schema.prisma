@@ -58,6 +58,9 @@ model DefinitionSyncJob {
   createdMetafieldDefinitions   Int                 @default(0)
   createdMetaobjectDefinitions  Int                 @default(0)
   addedMetaobjectFields         Int                 @default(0)
+  copiedMetaobjectEntries       Int                 @default(0)
+  skippedMetaobjectEntries      Int                 @default(0)
+  failedMetaobjectEntries       Int                 @default(0)
   conflictCount                 Int                 @default(0)
   failedCount                   Int                 @default(0)
   errorMessage                  String?

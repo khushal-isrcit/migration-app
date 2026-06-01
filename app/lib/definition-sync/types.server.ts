@@ -17,6 +17,7 @@ export const ITEM_TYPES = [
   "metafield_definition",
   "metaobject_definition",
   "metaobject_field",
+  "metaobject_entry",
 ] as const;
 
 export type TokenStatus = (typeof TOKEN_STATUSES)[number];
@@ -89,6 +90,8 @@ export interface MetaobjectDefinitionRecord {
   name: string;
   description?: string | null;
   displayNameKey?: string | null;
+  access?: { admin: string; storefront: string };
+  capabilities?: { publishable?: { enabled: boolean } };
   fieldDefinitions: MetaobjectFieldDefinitionRecord[];
 }
 

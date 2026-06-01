@@ -28,6 +28,9 @@ export async function updateSyncJob(
     createdMetafieldDefinitions?: number;
     createdMetaobjectDefinitions?: number;
     addedMetaobjectFields?: number;
+    copiedMetaobjectEntries?: number;
+    skippedMetaobjectEntries?: number;
+    failedMetaobjectEntries?: number;
     conflictCount?: number;
     failedCount?: number;
     errorMessage?: string | null;
@@ -63,4 +66,21 @@ export async function getLatestSyncJob(targetShop: string) {
     where: { targetShop },
     orderBy: { createdAt: "desc" },
   });
+}
+
+export async function getAllSyncJobs(
+  targetShop: string,
+  page = 1,
+  pageSize = 10,
+) {
+  const [jobs, total] = await Promise.all([
+    prisma.definitionSyncJob.findMany({
+      where: { targetShop },
+      orderBy: { createdAt: "desc" },
+      skip: (page - 1) * pageSize,
+      take: pageSize,
+    }),
+    prisma.definitionSyncJob.count({ where: { targetShop } }),
+  ]);
+  return { jobs, total, totalPages: Math.max(1, Math.ceil(total / pageSize)) };
 }

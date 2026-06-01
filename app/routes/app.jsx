@@ -21,8 +21,10 @@ export default function App() {
       <PolarisAppProvider i18n={enTranslations}>
         <NavMenu>
           <a href="/app" rel="home">
-            Home
+            Dashboard
           </a>
+          <a href="/app/files">Files Migration</a>
+          <a href="/app/history">Sync History</a>
         </NavMenu>
         <Outlet />
       </PolarisAppProvider>

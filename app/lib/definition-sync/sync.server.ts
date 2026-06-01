@@ -3,12 +3,17 @@ import {
   compareMetafieldDefinitions,
   compareMetaobjectDefinitions,
 } from "./compare.server";
+import { syncMetaobjectContent } from "./content-sync.server";
 import { decryptToken } from "./encryption.server";
 import {
   createSyncJob,
   createSyncLog,
   updateSyncJob,
 } from "./logger.server";
+import {
+  getMetaobjectTypeLogicalKey,
+  isAppReservedMetaobjectType,
+} from "./metaobject-type.server";
 import {
   createMetafieldDefinition,
   fetchMetafieldDefinitions,
@@ -111,6 +116,37 @@ function buildTargetMetaobjectIdByType(
   }
 
   return targetMetaobjectIdByType;
+}
+
+function buildTargetMetaobjectTypeBySourceType(
+  preview: DefinitionScanPreview,
+  targetDefinitions: MetaobjectDefinitionRecord[],
+) {
+  const targetTypeByLogicalKey = new Map(
+    targetDefinitions
+      .filter((definition) => isAppReservedMetaobjectType(definition.type))
+      .map((definition) => [
+        getMetaobjectTypeLogicalKey(definition.type),
+        definition.type,
+      ]),
+  );
+
+  const targetTypeBySourceType = new Map<string, string>();
+
+  for (const definition of [
+    ...preview.metaobjects.missing,
+    ...preview.metaobjects.existing.map((item) => item.source),
+  ]) {
+    const logicalType = getMetaobjectTypeLogicalKey(definition.type);
+    const targetType = targetTypeByLogicalKey.get(logicalType);
+
+    if (targetType) {
+      targetTypeBySourceType.set(definition.type, targetType);
+      targetTypeBySourceType.set(logicalType, targetType);
+    }
+  }
+
+  return targetTypeBySourceType;
 }
 
 function remapMetaobjectReferenceValidations(
@@ -633,11 +669,13 @@ export async function runDefinitionSync({
   admin,
   selectedMetaobjectTypes,
   selectedMetafieldKeys,
+  copyContent = false,
 }: {
   targetShop: string;
   admin: NonNullable<AdminGraphqlClient>;
   selectedMetaobjectTypes?: string[];
   selectedMetafieldKeys?: string[];
+  copyContent?: boolean;
 }) {
   const credential = await prisma.sourceStoreCredential.findUnique({
     where: { targetShop },
@@ -656,33 +694,35 @@ export async function runDefinitionSync({
 
   const selectedMetaobjectTypeSet = new Set(selectedMetaobjectTypes ?? []);
   const selectedMetafieldKeySet = new Set(selectedMetafieldKeys ?? []);
-  const shouldFilterMetaobjects = selectedMetaobjectTypeSet.size > 0;
-  const shouldFilterMetafields = selectedMetafieldKeySet.size > 0;
+  const hasAnySelections =
+    selectedMetaobjectTypeSet.size > 0 || selectedMetafieldKeySet.size > 0;
+  const shouldIncludeMetaobjects = selectedMetaobjectTypeSet.size > 0;
+  const shouldIncludeMetafields = selectedMetafieldKeySet.size > 0;
 
   const filteredPreview: DefinitionScanPreview = {
     ...preview,
     summary: {
       ...preview.summary,
-      totalSourceMetafieldDefinitions: shouldFilterMetafields
+      totalSourceMetafieldDefinitions: hasAnySelections
         ? preview.metafields.missing.filter((definition) =>
             selectedMetafieldKeySet.has(
               `${definition.ownerType}:${definition.namespace}:${definition.key}`,
             ),
           ).length
         : preview.summary.totalSourceMetafieldDefinitions,
-      missingMetafieldDefinitions: shouldFilterMetafields
+      missingMetafieldDefinitions: hasAnySelections
         ? preview.metafields.missing.filter((definition) =>
             selectedMetafieldKeySet.has(
               `${definition.ownerType}:${definition.namespace}:${definition.key}`,
             ),
           ).length
         : preview.summary.missingMetafieldDefinitions,
-      totalSourceMetaobjectDefinitions: shouldFilterMetaobjects
+      totalSourceMetaobjectDefinitions: hasAnySelections
         ? preview.metaobjects.missing.filter((definition) =>
             selectedMetaobjectTypeSet.has(definition.type),
           ).length
         : preview.summary.totalSourceMetaobjectDefinitions,
-      missingMetaobjectDefinitions: shouldFilterMetaobjects
+      missingMetaobjectDefinitions: hasAnySelections
         ? preview.metaobjects.missing.filter((definition) =>
             selectedMetaobjectTypeSet.has(definition.type),
           ).length
@@ -690,21 +730,43 @@ export async function runDefinitionSync({
     },
     metafields: {
       ...preview.metafields,
-      missing: shouldFilterMetafields
+      missing: hasAnySelections
         ? preview.metafields.missing.filter((definition) =>
             selectedMetafieldKeySet.has(
               `${definition.ownerType}:${definition.namespace}:${definition.key}`,
             ),
           )
         : preview.metafields.missing,
+      existing: hasAnySelections
+        ? preview.metafields.existing.filter((definition) =>
+            selectedMetafieldKeySet.has(
+              `${definition.ownerType}:${definition.namespace}:${definition.key}`,
+            ),
+          )
+        : preview.metafields.existing,
+      conflicts: hasAnySelections
+        ? preview.metafields.conflicts.filter((conflict) =>
+            selectedMetafieldKeySet.has(conflict.key),
+          )
+        : preview.metafields.conflicts,
     },
     metaobjects: {
       ...preview.metaobjects,
-      missing: shouldFilterMetaobjects
+      missing: hasAnySelections
         ? preview.metaobjects.missing.filter((definition) =>
             selectedMetaobjectTypeSet.has(definition.type),
           )
         : preview.metaobjects.missing,
+      existing: hasAnySelections
+        ? preview.metaobjects.existing.filter((item) =>
+            selectedMetaobjectTypeSet.has(item.type),
+          )
+        : preview.metaobjects.existing,
+      conflicts: hasAnySelections
+        ? preview.metaobjects.conflicts.filter((item) =>
+            selectedMetaobjectTypeSet.has(item.type),
+          )
+        : preview.metaobjects.conflicts,
     },
   };
 
@@ -879,11 +941,46 @@ export async function runDefinitionSync({
       }
     }
 
+    let copiedMetaobjectEntries = 0;
+    let skippedMetaobjectEntries = 0;
+    let failedMetaobjectEntries = 0;
+
+    if (copyContent) {
+      const allMetaobjectTypes = [
+        ...filteredPreview.metaobjects.missing.map((d) => d.type),
+        ...filteredPreview.metaobjects.existing.map((d) => d.type),
+      ];
+
+      if (allMetaobjectTypes.length > 0) {
+        const targetTypeBySourceType = buildTargetMetaobjectTypeBySourceType(
+          filteredPreview,
+          refreshedTargetMetaobjects.definitions,
+        );
+
+        const contentResult = await syncMetaobjectContent({
+          sourceShop: credential.sourceShop,
+          sourceToken: decryptToken(credential.encryptedToken),
+          admin,
+          jobId: job.id,
+          metaobjectTypes: allMetaobjectTypes,
+          targetTypeBySourceType,
+        });
+
+        copiedMetaobjectEntries = contentResult.copiedEntries;
+        skippedMetaobjectEntries = contentResult.skippedEntries;
+        failedMetaobjectEntries = contentResult.failedEntries;
+        failedCount += contentResult.failedEntries;
+      }
+    }
+
     await updateSyncJob(job.id, {
       status: "completed",
       createdMetafieldDefinitions,
       createdMetaobjectDefinitions,
       addedMetaobjectFields,
+      copiedMetaobjectEntries,
+      skippedMetaobjectEntries,
+      failedMetaobjectEntries,
       conflictCount,
       failedCount,
     });

@@ -1,6 +1,8 @@
 import {
+  Badge,
   Banner,
   BlockStack,
+  Box,
   Button,
   Card,
   Checkbox,
@@ -9,7 +11,7 @@ import {
   InlineStack,
   Layout,
   Page,
-  Spinner,
+  ProgressBar,
   Text,
   TextField,
 } from "@shopify/polaris";
@@ -22,7 +24,6 @@ import {
 } from "react-router";
 import prisma from "../db.server";
 import {
-  InfoCard,
   KeyValueTable,
   StatusBadge,
   SummaryTable,
@@ -32,8 +33,14 @@ import {
   decryptToken,
   encryptToken,
 } from "../lib/definition-sync/encryption.server";
-import { getLatestSyncJob, getSyncLogs } from "../lib/definition-sync/logger.server";
-import { buildDefinitionScanPreview, runDefinitionSync } from "../lib/definition-sync/sync.server";
+import {
+  getLatestSyncJob,
+  getSyncLogs,
+} from "../lib/definition-sync/logger.server";
+import {
+  buildDefinitionScanPreview,
+  runDefinitionSync,
+} from "../lib/definition-sync/sync.server";
 import { validateSourceToken } from "../lib/definition-sync/source-admin.server";
 import {
   normalizeShopDomain,
@@ -43,42 +50,24 @@ import { authenticate } from "../shopify.server";
 
 export async function loader({ request }: LoaderFunctionArgs) {
   const { admin, session } = await authenticate.admin(request);
-  const credential = await prisma.sourceStoreCredential.findUnique({
-    where: { targetShop: session.shop },
-  });
-  const latestJob = await getLatestSyncJob(session.shop);
 
-  const response = await admin.graphql(`#graphql
-    query DefinitionSyncDashboardShop {
-      shop {
-        name
-        myshopifyDomain
+  const [credential, latestJob, shopResponse] = await Promise.all([
+    prisma.sourceStoreCredential.findUnique({
+      where: { targetShop: session.shop },
+    }),
+    getLatestSyncJob(session.shop),
+    admin.graphql(`#graphql
+      query DashboardShop {
+        shop { name myshopifyDomain }
       }
-    }
-  `);
-  const payload = await response.json();
+    `),
+  ]);
 
-  let preview = null;
-  let scanError = null;
-
-  if (credential?.tokenStatus === "valid") {
-    try {
-      preview = await buildDefinitionScanPreview({
-        sourceShop: credential.sourceShop,
-        sourceToken: decryptToken(credential.encryptedToken),
-        targetShop: session.shop,
-        admin,
-      });
-    } catch (error) {
-      scanError =
-        error instanceof Error ? error.message : "Failed to scan definitions.";
-    }
-  }
-
+  const shopPayload = await shopResponse.json();
   const logs = latestJob ? await getSyncLogs(latestJob.id) : [];
 
   return {
-    shop: payload.data.shop,
+    shop: shopPayload.data.shop,
     credential: credential
       ? {
           sourceShop: credential.sourceShop,
@@ -86,8 +75,6 @@ export async function loader({ request }: LoaderFunctionArgs) {
           lastValidatedAt: credential.lastValidatedAt?.toISOString() ?? null,
         }
       : null,
-    preview,
-    scanError,
     latestJob: latestJob
       ? {
           id: latestJob.id,
@@ -99,6 +86,9 @@ export async function loader({ request }: LoaderFunctionArgs) {
           createdMetafieldDefinitions: latestJob.createdMetafieldDefinitions,
           createdMetaobjectDefinitions: latestJob.createdMetaobjectDefinitions,
           addedMetaobjectFields: latestJob.addedMetaobjectFields,
+          copiedMetaobjectEntries: latestJob.copiedMetaobjectEntries,
+          skippedMetaobjectEntries: latestJob.skippedMetaobjectEntries,
+          failedMetaobjectEntries: latestJob.failedMetaobjectEntries,
           conflictCount: latestJob.conflictCount,
           failedCount: latestJob.failedCount,
           errorMessage: latestJob.errorMessage,
@@ -120,12 +110,59 @@ export async function action({ request }: ActionFunctionArgs) {
     await prisma.sourceStoreCredential.deleteMany({
       where: { targetShop: session.shop },
     });
+    return { ok: true, intent, message: "Source credentials removed." };
+  }
 
-    return {
-      ok: true,
-      intent,
-      message: "Source credentials removed.",
-    };
+  if (intent === "reset") {
+    const jobs = await prisma.definitionSyncJob.findMany({
+      where: { targetShop: session.shop },
+      select: { id: true },
+    });
+    if (jobs.length) {
+      await prisma.definitionSyncLog.deleteMany({
+        where: { jobId: { in: jobs.map((j) => j.id) } },
+      });
+      await prisma.definitionSyncJob.deleteMany({
+        where: { targetShop: session.shop },
+      });
+    }
+    await prisma.sourceStoreCredential.deleteMany({
+      where: { targetShop: session.shop },
+    });
+    return { ok: true, intent, message: "App reset to fresh state." };
+  }
+
+  if (intent === "scan") {
+    const credential = await prisma.sourceStoreCredential.findUnique({
+      where: { targetShop: session.shop },
+    });
+
+    if (!credential || credential.tokenStatus !== "valid") {
+      return {
+        ok: false,
+        intent,
+        error: "Connect a valid source store first.",
+      };
+    }
+
+    try {
+      const preview = await buildDefinitionScanPreview({
+        sourceShop: credential.sourceShop,
+        sourceToken: decryptToken(credential.encryptedToken),
+        targetShop: session.shop,
+        admin,
+      });
+      return { ok: true, intent, preview };
+    } catch (error) {
+      return {
+        ok: false,
+        intent,
+        error:
+          error instanceof Error
+            ? error.message
+            : "Failed to scan definitions.",
+      };
+    }
   }
 
   if (intent === "sync") {
@@ -136,27 +173,37 @@ export async function action({ request }: ActionFunctionArgs) {
       String(formData.get("selectedMetafieldKeys") || "[]"),
     ) as string[];
 
+    const copyContent = String(formData.get("copyContent")) === "true";
+
     if (!selectedMetaobjectTypes.length && !selectedMetafieldKeys.length) {
       return {
         ok: false,
         intent,
-        error: "Select at least one metaobject or metafield to sync.",
+        error: "Select at least one definition to sync.",
       };
     }
 
-    const result = await runDefinitionSync({
-      targetShop: session.shop,
-      admin,
-      selectedMetaobjectTypes,
-      selectedMetafieldKeys,
-    });
-
-    return {
-      ok: true,
-      intent,
-      message: "Sync completed.",
-      jobId: result.jobId,
-    };
+    try {
+      const result = await runDefinitionSync({
+        targetShop: session.shop,
+        admin,
+        selectedMetaobjectTypes,
+        selectedMetafieldKeys,
+        copyContent,
+      });
+      return {
+        ok: true,
+        intent,
+        message: "Sync completed successfully.",
+        jobId: result.jobId,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        intent,
+        error: error instanceof Error ? error.message : "Sync failed.",
+      };
+    }
   }
 
   const sourceShopInput = String(formData.get("sourceShop") || "");
@@ -236,34 +283,107 @@ export async function action({ request }: ActionFunctionArgs) {
   }
 }
 
-export default function DefinitionSyncSinglePage() {
-  const { shop, credential, preview, scanError, latestJob, latestLogs } =
+interface ScanPreview {
+  summary: Record<string, number>;
+  metafields: {
+    missing: Array<{
+      id?: string;
+      name: string;
+      namespace: string;
+      key: string;
+      ownerType: string;
+      type: string;
+    }>;
+    existing: Array<{
+      name: string;
+      namespace: string;
+      key: string;
+      ownerType: string;
+      type: string;
+    }>;
+    conflicts: Array<{
+      key: string;
+      source: { name: string; type: string };
+      target: { type: string };
+    }>;
+  };
+  metaobjects: {
+    missing: Array<{
+      type: string;
+      name: string;
+      fieldDefinitions: Array<{ key: string; name: string }>;
+    }>;
+    existing: Array<{
+      source: {
+        type: string;
+        name: string;
+        fieldDefinitions: Array<{ key: string; name: string }>;
+      };
+    }>;
+    conflicts: Array<{
+      source: {
+        type: string;
+        name: string;
+        fieldDefinitions: Array<{ key: string; name: string }>;
+      };
+    }>;
+  };
+  ownerTypeWarnings: string[];
+}
+
+export default function DefinitionSyncDashboard() {
+  const { shop, credential, latestJob, latestLogs } =
     useLoaderData<typeof loader>();
+
   const connectionFetcher = useFetcher<typeof action>();
+  const scanFetcher = useFetcher<typeof action>();
   const syncFetcher = useFetcher<typeof action>();
-  const actionData = (
-    syncFetcher.data?.intent === "sync" ? syncFetcher.data : connectionFetcher.data
-  ) as
+  const resetFetcher = useFetcher<typeof action>();
+
+  const [sourceShop, setSourceShop] = useState(credential?.sourceShop ?? "");
+  const [sourceToken, setSourceToken] = useState("");
+  const [selectedMetaobjectTypes, setSelectedMetaobjectTypes] = useState<
+    string[]
+  >([]);
+  const [selectedMetafieldKeys, setSelectedMetafieldKeys] = useState<string[]>(
+    [],
+  );
+  const [copyContent, setCopyContent] = useState(false);
+  const [logsPage, setLogsPage] = useState(1);
+  const [showConnectionForm, setShowConnectionForm] = useState(!credential);
+
+  const isSaving = connectionFetcher.state !== "idle";
+  const isScanning = scanFetcher.state !== "idle";
+  const isSyncing = syncFetcher.state !== "idle";
+
+  const scanData = scanFetcher.data as
+    | {
+        ok: boolean;
+        intent: string;
+        preview?: ScanPreview;
+        error?: string;
+      }
+    | undefined;
+  const preview =
+    scanData?.intent === "scan" && scanData?.ok
+      ? (scanData.preview as ScanPreview)
+      : null;
+  const scanError =
+    scanData?.intent === "scan" && !scanData?.ok ? scanData.error : null;
+
+  const syncData = syncFetcher.data as
+    | { ok: boolean; intent: string; message?: string; error?: string }
+    | undefined;
+
+  const connectionData = connectionFetcher.data as
     | {
         ok: boolean;
         intent: string;
         message?: string;
         error?: string;
-        fieldErrors?: {
-          sourceShop?: string;
-          sourceToken?: string;
-        };
+        fieldErrors?: { sourceShop?: string; sourceToken?: string };
       }
     | undefined;
-  const [sourceShop, setSourceShop] = useState(credential?.sourceShop ?? "");
-  const [sourceToken, setSourceToken] = useState("");
-  const [selectedMetaobjectTypes, setSelectedMetaobjectTypes] = useState<string[]>(
-    [],
-  );
-  const [selectedMetafieldKeys, setSelectedMetafieldKeys] = useState<string[]>([]);
-  const [logsPage, setLogsPage] = useState(1);
-  const isSaving = connectionFetcher.state !== "idle";
-  const isSyncing = syncFetcher.state !== "idle";
 
   useEffect(() => {
     setSelectedMetaobjectTypes([]);
@@ -274,55 +394,70 @@ export default function DefinitionSyncSinglePage() {
     setLogsPage(1);
   }, [latestJob?.id]);
 
-  function handleSave() {
-    connectionFetcher.submit(
-      {
-        intent: "save",
-        sourceShop,
-        sourceToken,
-      },
-      { method: "post" },
-    );
-  }
+  useEffect(() => {
+    if (connectionData?.ok && connectionData.intent === "remove") {
+      setShowConnectionForm(true);
+    }
+  }, [connectionData]);
 
-  function handleRemove() {
-    connectionFetcher.submit(
-      {
-        intent: "remove",
-      },
-      { method: "post" },
-    );
-  }
+  const resetData = resetFetcher.data as
+    | { ok: boolean; intent: string; message?: string }
+    | undefined;
 
-  function handleSync() {
-    const formData = new FormData();
-    formData.set("intent", "sync");
-    formData.set(
-      "selectedMetaobjectTypes",
-      JSON.stringify(selectedMetaobjectTypes),
-    );
-    formData.set("selectedMetafieldKeys", JSON.stringify(selectedMetafieldKeys));
+  useEffect(() => {
+    if (resetData?.ok && resetData.intent === "reset") {
+      setSourceShop("");
+      setSourceToken("");
+      setSelectedMetaobjectTypes([]);
+      setSelectedMetafieldKeys([]);
+      setCopyContent(false);
+      setShowConnectionForm(true);
+      setLogsPage(1);
+      window.location.reload();
+    }
+  }, [resetData]);
 
-    syncFetcher.submit(
-      formData,
-      { method: "post" },
-    );
-  }
+  const missingMetaobjects = preview?.metaobjects.missing ?? [];
+  const existingMetaobjects = preview?.metaobjects.existing ?? [];
+  const missingMetafields = preview?.metafields.missing ?? [];
+  const totalSelectedCount =
+    selectedMetaobjectTypes.length + selectedMetafieldKeys.length;
+  const allSelectableTypes = [
+    ...missingMetaobjects.map((i) => i.type),
+    ...(copyContent ? existingMetaobjects.map((i) => i.source.type) : []),
+  ];
+  const allSelectableCount = allSelectableTypes.length + missingMetafields.length;
+  const allSelected =
+    allSelectableCount > 0 && totalSelectedCount === allSelectableCount;
 
-  function toggleMetaobjectSelection(type: string) {
-    setSelectedMetaobjectTypes((current) =>
-      current.includes(type)
-        ? current.filter((value) => value !== type)
-        : [...current, type],
-    );
-  }
+  const metafieldNameByIdentifier = new Map<string, string>();
+  const metaobjectNameByType = new Map<string, string>();
+  const metaobjectFieldNameByIdentifier = new Map<string, string>();
 
-  function toggleMetafieldSelection(identifier: string) {
-    setSelectedMetafieldKeys((current) =>
-      current.includes(identifier)
-        ? current.filter((value) => value !== identifier)
-        : [...current, identifier],
-    );
+  if (preview) {
+    for (const def of [
+      ...preview.metafields.missing,
+      ...preview.metafields.existing,
+      ...preview.metafields.conflicts.map((c) => c.source),
+    ]) {
+      metafieldNameByIdentifier.set(
+        `${(def as any).ownerType}:${(def as any).namespace}:${(def as any).key}`,
+        def.name,
+      );
+    }
+    for (const def of [
+      ...preview.metaobjects.missing,
+      ...preview.metaobjects.existing.map((i) => i.source),
+      ...preview.metaobjects.conflicts.map((i) => i.source),
+    ]) {
+      metaobjectNameByType.set(def.type, def.name);
+      for (const field of def.fieldDefinitions) {
+        metaobjectFieldNameByIdentifier.set(
+          `${def.type}.${field.key}`,
+          `${def.name} — ${field.name}`,
+        );
+      }
+    }
   }
 
   const typedLogs = latestLogs as Array<{
@@ -333,210 +468,269 @@ export default function DefinitionSyncSinglePage() {
     message: string;
     createdAt: string;
   }>;
-  const missingMetaobjects = preview?.metaobjects.missing ?? [];
-  const missingMetafields = preview?.metafields.missing ?? [];
-  const totalSelectedCount =
-    selectedMetaobjectTypes.length + selectedMetafieldKeys.length;
-  const allSelectableCount = missingMetaobjects.length + missingMetafields.length;
-  const allSelected =
-    allSelectableCount > 0 && totalSelectedCount === allSelectableCount;
-  const metafieldNameByIdentifier = new Map<string, string>();
-  const metaobjectNameByType = new Map<string, string>();
-  const metaobjectFieldNameByIdentifier = new Map<string, string>();
-
-  if (preview) {
-    for (const definition of [
-      ...preview.metafields.missing,
-      ...preview.metafields.existing,
-      ...preview.metafields.conflicts.map((item) => item.source),
-    ]) {
-      metafieldNameByIdentifier.set(
-        `${definition.ownerType}:${definition.namespace}:${definition.key}`,
-        definition.name,
-      );
-    }
-
-    for (const definition of [
-      ...preview.metaobjects.missing,
-      ...preview.metaobjects.existing.map((item) => item.source),
-      ...preview.metaobjects.conflicts.map((item) => item.source),
-    ]) {
-      metaobjectNameByType.set(definition.type, definition.name);
-
-      for (const field of definition.fieldDefinitions) {
-        metaobjectFieldNameByIdentifier.set(
-          `${definition.type}.${field.key}`,
-          `${definition.name} - ${field.name}`,
-        );
-      }
-    }
-  }
-
   const paginatedLogs = typedLogs.slice((logsPage - 1) * 10, logsPage * 10);
   const totalLogPages = Math.max(1, Math.ceil(typedLogs.length / 10));
 
+  function handleSave() {
+    connectionFetcher.submit(
+      { intent: "save", sourceShop, sourceToken },
+      { method: "post" },
+    );
+  }
+
+  function handleRemove() {
+    connectionFetcher.submit({ intent: "remove" }, { method: "post" });
+  }
+
+  function handleScan() {
+    scanFetcher.submit({ intent: "scan" }, { method: "post" });
+  }
+
+  function handleSync() {
+    const fd = new FormData();
+    fd.set("intent", "sync");
+    fd.set("selectedMetaobjectTypes", JSON.stringify(selectedMetaobjectTypes));
+    fd.set("selectedMetafieldKeys", JSON.stringify(selectedMetafieldKeys));
+    fd.set("copyContent", copyContent ? "true" : "false");
+    syncFetcher.submit(fd, { method: "post" });
+  }
+
+  function toggleMetaobjectSelection(type: string) {
+    setSelectedMetaobjectTypes((c) =>
+      c.includes(type) ? c.filter((v) => v !== type) : [...c, type],
+    );
+  }
+
+  function toggleMetafieldSelection(id: string) {
+    setSelectedMetafieldKeys((c) =>
+      c.includes(id) ? c.filter((v) => v !== id) : [...c, id],
+    );
+  }
+
+  function toggleSelectAll() {
+    if (allSelected) {
+      setSelectedMetaobjectTypes([]);
+      setSelectedMetafieldKeys([]);
+    } else {
+      setSelectedMetaobjectTypes(allSelectableTypes);
+      setSelectedMetafieldKeys(
+        missingMetafields.map(
+          (i) => `${i.ownerType}:${i.namespace}:${i.key}`,
+        ),
+      );
+    }
+  }
+
   function displayItemType(itemType: string) {
-    return itemType === "metafield_definition" ? "Metafield" : "Metaobject";
+    if (itemType === "metafield_definition") return "Metafield";
+    if (itemType === "metaobject_entry") return "Entry";
+    return "Metaobject";
   }
 
   function displayIdentifier(log: (typeof typedLogs)[number]) {
-    if (log.itemKey === "scope-warning") {
-      return "Warning";
-    }
-
-    if (log.itemType === "metafield_definition") {
+    if (log.itemKey === "scope-warning") return "Warning";
+    if (log.itemType === "metafield_definition")
       return metafieldNameByIdentifier.get(log.itemKey) ?? log.itemKey;
-    }
-
-    if (log.itemType === "metaobject_field") {
+    if (log.itemType === "metaobject_field")
       return metaobjectFieldNameByIdentifier.get(log.itemKey) ?? log.itemKey;
-    }
-
     return metaobjectNameByType.get(log.itemKey) ?? log.itemKey;
   }
 
   return (
-    <Page title="Definition Sync">
+    <Page
+      title="Definition Sync"
+      subtitle={`${shop.name} (${shop.myshopifyDomain})`}
+    >
       <Layout>
-        <Layout.Section>
-          <BlockStack gap="400">
-            <Banner tone="info">
-              <p>
-                Connect the source store, review the missing metaobjects and
-                metafields below, then sync everything from this page.
-              </p>
-            </Banner>
-
-            <Card>
-              <BlockStack gap="300">
-                <InlineStack align="space-between" blockAlign="center">
-                  <Text as="h2" variant="headingMd">
-                    Source store connection
-                  </Text>
-                  <Text as="span" variant="bodyMd" fontWeight="medium">
-                    {shop.name} ({shop.myshopifyDomain})
-                  </Text>
-                </InlineStack>
-
-                {credential ? (
-                  <InlineStack gap="200" blockAlign="center">
-                    <Text as="span">Saved source: {credential.sourceShop}</Text>
-                    <StatusBadge status={credential.tokenStatus} />
+        {/* ── Connection Section ── */}
+        <Layout.AnnotatedSection
+          title="Source store"
+          description="Connect the source store you want to copy metafield and metaobject definitions from. Provide the .myshopify.com domain and a custom-app Admin API token."
+        >
+          <Card>
+            <BlockStack gap="400">
+              {credential && !showConnectionForm ? (
+                <BlockStack gap="300">
+                  <InlineStack gap="200" blockAlign="center" align="space-between">
+                    <InlineStack gap="200" blockAlign="center">
+                      <Text as="span" variant="bodyMd" fontWeight="semibold">
+                        {credential.sourceShop}
+                      </Text>
+                      <StatusBadge status={credential.tokenStatus} />
+                    </InlineStack>
+                    <InlineStack gap="200">
+                      <Button
+                        size="slim"
+                        onClick={() => setShowConnectionForm(true)}
+                      >
+                        Edit
+                      </Button>
+                      <Button
+                        size="slim"
+                        tone="critical"
+                        loading={isSaving}
+                        onClick={handleRemove}
+                      >
+                        Disconnect
+                      </Button>
+                    </InlineStack>
                   </InlineStack>
-                ) : null}
+                  {credential.lastValidatedAt ? (
+                    <Text as="p" tone="subdued" variant="bodySm">
+                      Last validated:{" "}
+                      {new Date(credential.lastValidatedAt).toLocaleString()}
+                    </Text>
+                  ) : null}
+                </BlockStack>
+              ) : (
+                <BlockStack gap="300">
+                  {connectionData?.message ? (
+                    <Banner
+                      tone={connectionData.ok ? "success" : "critical"}
+                      onDismiss={() => {}}
+                    >
+                      <p>{connectionData.message}</p>
+                    </Banner>
+                  ) : null}
 
-                {credential?.lastValidatedAt ? (
-                  <Text as="p" tone="subdued">
-                    Last validated:{" "}
-                    {new Date(credential.lastValidatedAt).toLocaleString()}
-                  </Text>
-                ) : null}
+                  {connectionData?.error && !connectionData.message ? (
+                    <Banner tone="critical">
+                      <p>{connectionData.error}</p>
+                    </Banner>
+                  ) : null}
 
-                {actionData?.message ? (
-                  <Banner tone={actionData.ok ? "success" : "critical"}>
-                    <p>{actionData.message ?? actionData.error}</p>
-                  </Banner>
-                ) : null}
+                  <FormLayout>
+                    <TextField
+                      label="Source store domain"
+                      autoComplete="off"
+                      value={sourceShop}
+                      onChange={setSourceShop}
+                      helpText="Example: source-store.myshopify.com"
+                      error={connectionData?.fieldErrors?.sourceShop}
+                    />
+                    <TextField
+                      label="Admin API access token"
+                      autoComplete="off"
+                      type="password"
+                      value={sourceToken}
+                      onChange={setSourceToken}
+                      helpText="Create a custom app in the source store and paste its Admin API token here."
+                      error={connectionData?.fieldErrors?.sourceToken}
+                    />
+                  </FormLayout>
 
-                {actionData?.error && !actionData.message ? (
-                  <Banner tone="critical">
-                    <p>{actionData.error}</p>
-                  </Banner>
-                ) : null}
-
-                <FormLayout>
-                  <TextField
-                    label="Source store domain"
-                    autoComplete="off"
-                    value={sourceShop}
-                    onChange={setSourceShop}
-                    helpText="Example: source-store.myshopify.com"
-                    error={connectionFetcher.data?.fieldErrors?.sourceShop}
-                  />
-                  <TextField
-                    label="Source Admin API access token"
-                    autoComplete="off"
-                    type="password"
-                    value={sourceToken}
-                    onChange={setSourceToken}
-                    helpText="Create a custom app in the source store and paste its Admin API token here."
-                    error={connectionFetcher.data?.fieldErrors?.sourceToken}
-                  />
-                </FormLayout>
-
-                <InlineStack gap="200">
-                  <Button
-                    variant="primary"
-                    loading={isSaving}
-                    onClick={handleSave}
-                    disabled={isSyncing}
-                  >
-                    {credential ? "Update and validate" : "Save and validate"}
-                  </Button>
-                  {credential ? (
+                  <InlineStack gap="200">
                     <Button
-                      tone="critical"
+                      variant="primary"
                       loading={isSaving}
-                      onClick={handleRemove}
+                      onClick={handleSave}
+                    >
+                      {credential ? "Update connection" : "Connect"}
+                    </Button>
+                    {credential ? (
+                      <Button onClick={() => setShowConnectionForm(false)}>
+                        Cancel
+                      </Button>
+                    ) : null}
+                  </InlineStack>
+                </BlockStack>
+              )}
+            </BlockStack>
+          </Card>
+        </Layout.AnnotatedSection>
+
+        {/* ── Scan & Sync Section ── */}
+        {credential?.tokenStatus === "valid" ? (
+          <Layout.Section>
+            <BlockStack gap="400">
+              <Card>
+                <BlockStack gap="400">
+                  <InlineStack align="space-between" blockAlign="center">
+                    <BlockStack gap="100">
+                      <Text as="h2" variant="headingMd">
+                        Scan definitions
+                      </Text>
+                      <Text as="p" tone="subdued" variant="bodySm">
+                        Compare metafield and metaobject definitions between source and target stores.
+                      </Text>
+                    </BlockStack>
+                    <Button
+                      variant="primary"
+                      loading={isScanning}
+                      onClick={handleScan}
                       disabled={isSyncing}
                     >
-                      Remove source
+                      {preview ? "Re-scan" : "Scan definitions"}
                     </Button>
+                  </InlineStack>
+
+                  {isScanning ? (
+                    <BlockStack gap="200">
+                      <Text as="p" tone="subdued">
+                        Scanning metafield and metaobject definitions across both stores…
+                      </Text>
+                      <ProgressBar progress={75} size="small" tone="primary" />
+                    </BlockStack>
                   ) : null}
-                </InlineStack>
-              </BlockStack>
-            </Card>
 
-            {credential?.tokenStatus === "valid" ? (
-              <>
-                {scanError ? (
-                  <Banner tone="critical" title="Scan failed">
-                    <p>{scanError}</p>
-                  </Banner>
-                ) : null}
+                  {scanError ? (
+                    <Banner tone="critical" title="Scan failed">
+                      <p>{scanError}</p>
+                    </Banner>
+                  ) : null}
+                </BlockStack>
+              </Card>
 
-                {preview ? (
-                  <>
-                    <WarningsBanner warnings={preview.ownerTypeWarnings} />
+              {preview ? (
+                <>
+                  <WarningsBanner warnings={preview.ownerTypeWarnings} />
 
-                    <InfoCard title="Ready To Sync">
+                  <Card>
+                    <BlockStack gap="300">
+                      <Text as="h2" variant="headingMd">
+                        Scan summary
+                      </Text>
                       <SummaryTable
                         rows={[
-                          ["Missing metafield definitions", preview.summary.missingMetafieldDefinitions],
-                          ["Conflicting metafield definitions", preview.summary.conflictingMetafieldDefinitions],
-                          ["Missing metaobject definitions", preview.summary.missingMetaobjectDefinitions],
-                          ["Missing metaobject fields", preview.summary.missingMetaobjectFields],
-                          ["Conflicting metaobject fields", preview.summary.conflictingMetaobjectFields],
+                          [
+                            "Missing metafield definitions",
+                            preview.summary.missingMetafieldDefinitions,
+                          ],
+                          [
+                            "Missing metaobject definitions",
+                            preview.summary.missingMetaobjectDefinitions,
+                          ],
+                          [
+                            "Missing metaobject fields",
+                            preview.summary.missingMetaobjectFields,
+                          ],
+                          [
+                            "Conflicting metafield definitions",
+                            preview.summary.conflictingMetafieldDefinitions,
+                          ],
+                          [
+                            "Conflicting metaobject fields",
+                            preview.summary.conflictingMetaobjectFields,
+                          ],
                         ]}
                       />
-                    </InfoCard>
+                    </BlockStack>
+                  </Card>
 
+                  {allSelectableCount > 0 ? (
                     <Card>
-                      <BlockStack gap="300">
-                        <InlineStack align="space-between" blockAlign="center">
+                      <BlockStack gap="400">
+                        <InlineStack
+                          align="space-between"
+                          blockAlign="center"
+                        >
                           <Text as="h2" variant="headingMd">
-                            Missing Definitions
+                            Select definitions to sync
                           </Text>
                           <InlineStack gap="200">
                             <Button
-                              onClick={() => {
-                                if (allSelected) {
-                                  setSelectedMetaobjectTypes([]);
-                                  setSelectedMetafieldKeys([]);
-                                  return;
-                                }
-
-                                setSelectedMetaobjectTypes(
-                                  missingMetaobjects.map((item) => item.type),
-                                );
-                                setSelectedMetafieldKeys(
-                                  missingMetafields.map(
-                                    (item) =>
-                                      `${item.ownerType}:${item.namespace}:${item.key}`,
-                                  ),
-                                );
-                              }}
-                              disabled={!allSelectableCount || isSyncing}
+                              onClick={toggleSelectAll}
+                              disabled={isSyncing}
                             >
                               {allSelected ? "Clear all" : "Select all"}
                             </Button>
@@ -546,162 +740,303 @@ export default function DefinitionSyncSinglePage() {
                               loading={isSyncing}
                               disabled={isSaving || totalSelectedCount === 0}
                             >
-                              Sync Selected
+                              Sync selected ({String(totalSelectedCount)})
                             </Button>
                           </InlineStack>
                         </InlineStack>
 
-                        {isSyncing ? (
-                          <InlineStack gap="200" blockAlign="center">
-                            <Spinner size="small" />
-                            <Text as="span">
-                              Syncing metaobjects and metafields. Please wait.
-                            </Text>
-                          </InlineStack>
+                        <Checkbox
+                          label="Copy metaobject entries (content/values)"
+                          checked={copyContent}
+                          onChange={setCopyContent}
+                          helpText="Also copy all metaobject entries from the source store to the target store."
+                          disabled={isSyncing}
+                        />
+
+                        {syncData?.intent === "sync" ? (
+                          <Banner
+                            tone={syncData.ok ? "success" : "critical"}
+                          >
+                            <p>
+                              {syncData.ok
+                                ? syncData.message
+                                : syncData.error}
+                            </p>
+                          </Banner>
                         ) : null}
 
-                        <InlineStack align="space-between" blockAlign="center">
-                          <Text as="h3" variant="headingMd">
-                            Missing Metaobjects
-                          </Text>
-                        </InlineStack>
-
-                        {preview.metaobjects.missing.length ? (
+                        {isSyncing ? (
                           <BlockStack gap="200">
-                            {preview.metaobjects.missing.map((item) => (
-                              <InlineStack
-                                key={item.type}
-                                align="space-between"
-                                blockAlign="center"
-                              >
-                                <BlockStack gap="100">
-                                  <Text as="span" variant="bodyMd" fontWeight="medium">
-                                    {item.name}
-                                  </Text>
-                                  <Text as="span" tone="subdued">
-                                    Type: {item.type}
-                                  </Text>
-                                </BlockStack>
-                                <Checkbox
-                                  label=""
-                                  checked={selectedMetaobjectTypes.includes(item.type)}
-                                  onChange={() => toggleMetaobjectSelection(item.type)}
-                                />
-                              </InlineStack>
-                            ))}
+                            <Text as="p" tone="subdued">
+                              Syncing selected definitions…
+                            </Text>
+                            <ProgressBar
+                              progress={50}
+                              size="small"
+                              tone="primary"
+                            />
                           </BlockStack>
-                        ) : (
-                          <Text as="p" tone="subdued">
-                            No missing metaobject definitions were found.
-                          </Text>
-                        )}
+                        ) : null}
 
-                        <Divider />
-
-                        <InlineStack align="space-between" blockAlign="center">
-                          <Text as="h3" variant="headingMd">
-                            Missing Metafields
-                          </Text>
-                        </InlineStack>
-                        {preview.metafields.missing.length ? (
+                        {missingMetaobjects.length > 0 ? (
                           <BlockStack gap="200">
-                            {preview.metafields.missing.map((item) => {
-                              const identifier = `${item.ownerType}:${item.namespace}:${item.key}`;
-
-                              return (
+                            <Text as="h3" variant="headingSm">
+                              Missing metaobjects
+                            </Text>
+                            {missingMetaobjects.map((item) => (
+                              <Box
+                                key={item.type}
+                                padding="200"
+                                borderRadius="200"
+                                background="bg-surface-secondary"
+                              >
                                 <InlineStack
-                                  key={identifier}
                                   align="space-between"
                                   blockAlign="center"
                                 >
-                                  <BlockStack gap="100">
-                                    <Text as="span" variant="bodyMd" fontWeight="medium">
+                                  <BlockStack gap="050">
+                                    <Text
+                                      as="span"
+                                      variant="bodyMd"
+                                      fontWeight="semibold"
+                                    >
                                       {item.name}
                                     </Text>
-                                    <Text as="span" tone="subdued">
-                                      {item.ownerType} | {item.namespace} | {item.type}
+                                    <Text as="span" variant="bodySm" tone="subdued">
+                                      Type: {item.type} ·{" "}
+                                      {item.fieldDefinitions.length} fields
                                     </Text>
                                   </BlockStack>
                                   <Checkbox
                                     label=""
-                                    checked={selectedMetafieldKeys.includes(identifier)}
-                                    onChange={() => toggleMetafieldSelection(identifier)}
+                                    checked={selectedMetaobjectTypes.includes(
+                                      item.type,
+                                    )}
+                                    onChange={() =>
+                                      toggleMetaobjectSelection(item.type)
+                                    }
                                   />
                                 </InlineStack>
+                              </Box>
+                            ))}
+                          </BlockStack>
+                        ) : null}
+
+                        {copyContent && existingMetaobjects.length > 0 ? (
+                          <BlockStack gap="200">
+                            <Text as="h3" variant="headingSm">
+                              Existing metaobjects (copy entries)
+                            </Text>
+                            {existingMetaobjects.map((item) => (
+                              <Box
+                                key={item.source.type}
+                                padding="200"
+                                borderRadius="200"
+                                background="bg-surface-secondary"
+                              >
+                                <InlineStack
+                                  align="space-between"
+                                  blockAlign="center"
+                                >
+                                  <BlockStack gap="050">
+                                    <Text
+                                      as="span"
+                                      variant="bodyMd"
+                                      fontWeight="semibold"
+                                    >
+                                      {item.source.name}
+                                    </Text>
+                                    <Text as="span" variant="bodySm" tone="subdued">
+                                      Type: {item.source.type} · Definition exists, entries will be copied
+                                    </Text>
+                                  </BlockStack>
+                                  <Checkbox
+                                    label=""
+                                    checked={selectedMetaobjectTypes.includes(
+                                      item.source.type,
+                                    )}
+                                    onChange={() =>
+                                      toggleMetaobjectSelection(item.source.type)
+                                    }
+                                  />
+                                </InlineStack>
+                              </Box>
+                            ))}
+                          </BlockStack>
+                        ) : null}
+
+                        {(missingMetaobjects.length > 0 || (copyContent && existingMetaobjects.length > 0)) &&
+                        missingMetafields.length > 0 ? (
+                          <Divider />
+                        ) : null}
+
+                        {missingMetafields.length > 0 ? (
+                          <BlockStack gap="200">
+                            <Text as="h3" variant="headingSm">
+                              Missing metafields
+                            </Text>
+                            {missingMetafields.map((item) => {
+                              const identifier = `${item.ownerType}:${item.namespace}:${item.key}`;
+                              return (
+                                <Box
+                                  key={identifier}
+                                  padding="200"
+                                  borderRadius="200"
+                                  background="bg-surface-secondary"
+                                >
+                                  <InlineStack
+                                    align="space-between"
+                                    blockAlign="center"
+                                  >
+                                    <BlockStack gap="050">
+                                      <Text
+                                        as="span"
+                                        variant="bodyMd"
+                                        fontWeight="semibold"
+                                      >
+                                        {item.name}
+                                      </Text>
+                                      <Text
+                                        as="span"
+                                        variant="bodySm"
+                                        tone="subdued"
+                                      >
+                                        {item.ownerType} · {item.namespace}.
+                                        {item.key} · {item.type}
+                                      </Text>
+                                    </BlockStack>
+                                    <Checkbox
+                                      label=""
+                                      checked={selectedMetafieldKeys.includes(
+                                        identifier,
+                                      )}
+                                      onChange={() =>
+                                        toggleMetafieldSelection(identifier)
+                                      }
+                                    />
+                                  </InlineStack>
+                                </Box>
                               );
                             })}
                           </BlockStack>
-                        ) : (
-                          <Text as="p" tone="subdued">
-                            No missing metafield definitions were found.
-                          </Text>
-                        )}
+                        ) : null}
                       </BlockStack>
                     </Card>
-                  </>
-                ) : null}
-              </>
-            ) : (
-              <Banner tone="warning">
-                <p>
-                  Save a valid source store domain and Admin API token to load
-                  the metaobject and metafield preview.
-                </p>
-              </Banner>
-            )}
-
-            {credential?.tokenStatus === "valid" && latestJob ? (
-              <Card>
-                <BlockStack gap="300">
-                  <Text as="h2" variant="headingMd">
-                    Latest Sync Result
-                  </Text>
-                  <InlineStack gap="200" blockAlign="center">
-                    <StatusBadge status={latestJob.status} />
-                    <Text as="span">
-                      {latestJob.sourceShop} to {latestJob.targetShop}
-                    </Text>
-                  </InlineStack>
-                  {latestJob.errorMessage ? (
-                    <Banner tone="critical">
-                      <p>{latestJob.errorMessage}</p>
+                  ) : (
+                    <Banner tone="success">
+                      <p>
+                        All metafield and metaobject definitions are already in
+                        sync between source and target stores.
+                      </p>
                     </Banner>
-                  ) : null}
-                  <SummaryTable
-                    rows={[
-                      ["Created metafield definitions", latestJob.createdMetafieldDefinitions],
-                      ["Created metaobject definitions", latestJob.createdMetaobjectDefinitions],
-                      ["Added metaobject fields", latestJob.addedMetaobjectFields],
-                      ["Warnings and conflicts", latestJob.conflictCount],
-                      ["Failures", latestJob.failedCount],
-                    ]}
-                  />
+                  )}
+                </>
+              ) : null}
+            </BlockStack>
+          </Layout.Section>
+        ) : credential ? (
+          <Layout.Section>
+            <Banner tone="warning">
+              <p>
+                The source store token is invalid. Update the connection above
+                with a working Admin API access token.
+              </p>
+            </Banner>
+          </Layout.Section>
+        ) : null}
 
-                  {typedLogs.length ? (
-                    <BlockStack gap="300">
-                      <KeyValueTable
-                        headings={["Status", "Item", "Identifier", "Message"]}
-                        rows={paginatedLogs.map((log) => [
-                          <StatusBadge key={`${log.id}-status`} status={log.status} />,
-                          displayItemType(log.itemType),
-                          displayIdentifier(log),
-                          log.message,
-                        ])}
-                      />
+        {/* ── Latest Sync Result ── */}
+        {latestJob ? (
+          <Layout.Section>
+            <Card>
+              <BlockStack gap="400">
+                <InlineStack align="space-between" blockAlign="center">
+                  <Text as="h2" variant="headingMd">
+                    Latest sync result
+                  </Text>
+                  <Badge tone={latestJob.status === "completed" ? "success" : latestJob.status === "failed" ? "critical" : "attention"}>
+                    {latestJob.status}
+                  </Badge>
+                </InlineStack>
+
+                <Text as="p" tone="subdued" variant="bodySm">
+                  {latestJob.sourceShop} → {latestJob.targetShop} ·{" "}
+                  {new Date(latestJob.createdAt).toLocaleString()}
+                </Text>
+
+                {latestJob.errorMessage ? (
+                  <Banner tone="critical">
+                    <p>{latestJob.errorMessage}</p>
+                  </Banner>
+                ) : null}
+
+                <SummaryTable
+                  rows={[
+                    [
+                      "Created metafield definitions",
+                      latestJob.createdMetafieldDefinitions,
+                    ],
+                    [
+                      "Created metaobject definitions",
+                      latestJob.createdMetaobjectDefinitions,
+                    ],
+                    [
+                      "Added metaobject fields",
+                      latestJob.addedMetaobjectFields,
+                    ],
+                    [
+                      "Copied metaobject entries",
+                      latestJob.copiedMetaobjectEntries,
+                    ],
+                    [
+                      "Skipped metaobject entries",
+                      latestJob.skippedMetaobjectEntries,
+                    ],
+                    ["Warnings / conflicts", latestJob.conflictCount],
+                    ["Failures", latestJob.failedCount],
+                  ]}
+                />
+
+                {typedLogs.length > 0 ? (
+                  <>
+                    <Divider />
+                    <Text as="h3" variant="headingSm">
+                      Sync log
+                    </Text>
+                    <KeyValueTable
+                      headings={["Status", "Item", "Identifier", "Message", "Date & Time"]}
+                      rows={paginatedLogs.map((log) => [
+                        <StatusBadge
+                          key={`${log.id}-status`}
+                          status={log.status}
+                        />,
+                        displayItemType(log.itemType),
+                        displayIdentifier(log),
+                        log.message,
+                        new Date(log.createdAt).toLocaleString(),
+                      ])}
+                    />
+                    {totalLogPages > 1 ? (
                       <InlineStack align="space-between" blockAlign="center">
-                        <Text as="span" tone="subdued">
+                        <Text as="span" tone="subdued" variant="bodySm">
                           Page {logsPage} of {totalLogPages}
                         </Text>
                         <InlineStack gap="200">
                           <Button
-                            onClick={() => setLogsPage((page) => Math.max(1, page - 1))}
+                            size="slim"
+                            onClick={() =>
+                              setLogsPage((p) => Math.max(1, p - 1))
+                            }
                             disabled={logsPage === 1}
                           >
                             Previous
                           </Button>
                           <Button
+                            size="slim"
                             onClick={() =>
-                              setLogsPage((page) => Math.min(totalLogPages, page + 1))
+                              setLogsPage((p) =>
+                                Math.min(totalLogPages, p + 1),
+                              )
                             }
                             disabled={logsPage === totalLogPages}
                           >
@@ -709,16 +1044,36 @@ export default function DefinitionSyncSinglePage() {
                           </Button>
                         </InlineStack>
                       </InlineStack>
-                    </BlockStack>
-                  ) : (
-                    <Text as="p" tone="subdued">
-                      No sync messages are available yet.
-                    </Text>
-                  )}
-                </BlockStack>
-              </Card>
-            ) : null}
-          </BlockStack>
+                    ) : null}
+                  </>
+                ) : null}
+              </BlockStack>
+            </Card>
+          </Layout.Section>
+        ) : null}
+        <Layout.Section>
+          <Card>
+            <BlockStack gap="200">
+              <Text as="h3" variant="headingSm" tone="critical">
+                Reset app
+              </Text>
+              <Text as="p" variant="bodySm" tone="subdued">
+                Remove all credentials, sync history, and logs. This does not
+                undo changes already made in the target store.
+              </Text>
+              <InlineStack>
+                <Button
+                  tone="critical"
+                  onClick={() =>
+                    resetFetcher.submit({ intent: "reset" }, { method: "post" })
+                  }
+                  loading={resetFetcher.state !== "idle"}
+                >
+                  Reset to fresh state
+                </Button>
+              </InlineStack>
+            </BlockStack>
+          </Card>
         </Layout.Section>
       </Layout>
     </Page>

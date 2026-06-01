@@ -1,5 +1,9 @@
 import { sourceAdminGraphql } from "./source-admin.server";
 import { assertNoUserErrors, targetAdminGraphql } from "./target-admin.server";
+import {
+  isAppReservedMetaobjectType,
+  toMetaobjectDefinitionCreateType,
+} from "./metaobject-type.server";
 import type {
   GraphqlUserError,
   MetaobjectDefinitionFetchResult,
@@ -22,6 +26,15 @@ interface MetaobjectDefinitionsResponse {
       name: string;
       description?: string | null;
       displayNameKey?: string | null;
+      access: {
+        admin: string;
+        storefront: string;
+      };
+      capabilities?: {
+        publishable?: {
+          enabled: boolean;
+        };
+      };
       fieldDefinitions: Array<{
         key: string;
         name: string;
@@ -47,6 +60,13 @@ export function normalizeMetaobjectDefinition(
     name: definition.name,
     description: definition.description ?? null,
     displayNameKey: definition.displayNameKey ?? null,
+    access: {
+      admin: definition.access.admin,
+      storefront: definition.access.storefront,
+    },
+    capabilities: definition.capabilities?.publishable
+      ? { publishable: { enabled: definition.capabilities.publishable.enabled } }
+      : undefined,
     fieldDefinitions: definition.fieldDefinitions.map((field) => ({
       key: field.key,
       name: field.name,
@@ -86,6 +106,15 @@ async function fetchAll(
               name
               description
               displayNameKey
+              access {
+                admin
+                storefront
+              }
+              capabilities {
+                publishable {
+                  enabled
+                }
+              }
               fieldDefinitions {
                 key
                 name
@@ -144,6 +173,19 @@ export async function createMetaobjectDefinition(
   admin: AdminGraphqlClient,
   definition: MetaobjectDefinitionRecord,
 ) {
+  const targetType = toMetaobjectDefinitionCreateType(definition.type);
+  const access = isAppReservedMetaobjectType(targetType)
+    ? {
+        admin:
+          definition.access?.admin === "MERCHANT_READ"
+            ? "MERCHANT_READ"
+            : "MERCHANT_READ_WRITE",
+        storefront: definition.access?.storefront ?? "NONE",
+      }
+    : definition.access?.storefront
+      ? { storefront: definition.access.storefront }
+      : undefined;
+
   const data = await targetAdminGraphql<
     {
       metaobjectDefinitionCreate: {
@@ -171,9 +213,13 @@ export async function createMetaobjectDefinition(
     {
       definition: {
         name: definition.name,
-        type: definition.type,
+        type: targetType,
         description: definition.description,
         displayNameKey: definition.displayNameKey,
+        access,
+        capabilities: definition.capabilities?.publishable?.enabled
+          ? { publishable: { enabled: true } }
+          : undefined,
         fieldDefinitions: definition.fieldDefinitions.map((field) => ({
           key: field.key,
           name: field.name,
